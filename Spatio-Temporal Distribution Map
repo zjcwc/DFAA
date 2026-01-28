@@ -1,0 +1,178 @@
+# ggplot Styled Base Map: Grey World + China/Zone Boundaries + Diverging Colormap (0 centered)
+# Exports: PNG & TIF
+# Dependencies: terra, sf, rnaturalearth, ggplot2, dplyr
+# =========================================================
+
+# =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+#
+# --------- [Modify Here] CONFIGURATION ---------
+#
+# =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+# ===== 1. Legend Content and Style =====
+LEGEND_TITLE       <- "kNDVI TAC Trend"
+LEGEND_TITLE_SIZE  <- 10
+LEGEND_TEXT_SIZE   <- 9
+LEGEND_LINEHEIGHT  <- 1.1
+
+# ===== 2. Legend Position =====
+LEGEND_POS_X <- 0.03
+LEGEND_POS_Y <- 0.03
+
+# ===== 3. Color Scheme =====
+PALETTE_NAME    <- "RedBlue_deep"  # "RedBlue_deep", "RedBlue_vivid", "BrownBlue"
+REVERSE_COLORS  <- FALSE           
+COLOR_SQUEEZE   <- 2.5             # Color contrast enhancement factor
+
+# ===== 4. Map Style =====
+CHINA_BORDER_LWD <- 0.4
+ZONE_BORDER_LWD  <- 0.25
+ZONE_BORDER_COL  <- "grey40"
+
+# ---------- Input / Output (Generic Paths) ----------
+# Replace these with your actual file paths
+IN_R             <- "PATH/TO/YOUR/INPUT_RASTER.tif"
+CHINA_SHP_PATH   <- "PATH/TO/YOUR/CHINA_BOUNDARY.shp"
+ZONE_PATH        <- "PATH/TO/YOUR/CLIMATE_ZONES.shp"
+ZONE_FIELD       <- "clim4"  # <--- [New] Field name for dissolving boundaries
+
+OUT_DIR          <- "PATH/TO/YOUR/OUTPUT_DIR"
+OUT_PNG          <- file.path(OUT_DIR, "Map_Visualization_Output.png")
+OUT_TIF          <- file.path(OUT_DIR, "Map_Visualization_Output.tif")
+
+# ---------- Other Plotting Controls ----------
+IMG_WIDTH_IN    <- 8.0
+IMG_HEIGHT_IN   <- 6.8
+IMG_DPI         <- 300
+WORLD_FILL      <- "grey92"
+WORLD_LINE      <- "white"
+PLOT_RES_DEG    <- 0.05
+MARGIN_LON      <- 1.5
+MARGIN_LAT      <- 1.0
+
+# =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+#
+# --------- [Code Below Executes Automatically] ---------
+#
+# =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+suppressPackageStartupMessages({
+  library(terra)
+  library(sf)
+  library(rnaturalearth)
+  library(ggplot2)
+  library(scales)
+  library(dplyr) # [New] For dissolving boundaries
+})
+
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+# ===== Color Palette Function =====
+get_diverging_palette <- function(name, reverse=FALSE){
+  pal <- switch(
+    name,
+    "RedBlue_deep" = c("#08306b", "#4292c6", "#f7f7f7", "#ef8a62", "#67000d"),
+    "RedBlue_vivid" = c("#2166ac", "#67a9cf", "#f7f7f7", "#ef8a62", "#b2182b"),
+    "BrownBlue" = c("#0571b0", "#92c5de", "#f7f7f7", "#f4a582", "#ca0020"),
+    c("#08306b", "#4292c6", "#f7f7f7", "#ef8a62", "#67000d")
+  )
+  if (isTRUE(reverse)) pal <- rev(pal)
+  pal
+}
+
+# ---------- 1. Load Data ----------
+message("Loading data...")
+stopifnot(file.exists(IN_R), file.exists(CHINA_SHP_PATH), file.exists(ZONE_PATH))
+
+r0 <- terra::rast(IN_R)
+r_ll <- terra::project(r0, "EPSG:4326")
+
+china_sf <- sf::st_read(CHINA_SHP_PATH, quiet = TRUE) |> sf::st_transform(4326)
+zones_raw <- sf::st_read(ZONE_PATH, quiet = TRUE) |> sf::st_transform(4326)
+world_sf <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf") |> sf::st_transform(4326)
+
+# ---------- 2. [Critical Step] Dissolve Zone Boundaries ----------
+message("Dissolving zone boundaries...")
+
+# Check if field exists
+if (!ZONE_FIELD %in% names(zones_raw)) {
+  stop(paste0("Error: Field '", ZONE_FIELD, "' not found in shapefile. Available fields: ", paste(names(zones_raw), collapse=", ")))
+}
+
+# Use dplyr for geometric dissolving
+zones_dissolved <- zones_raw |>
+  group_by(across(all_of(ZONE_FIELD))) |>
+  summarise(geometry = st_union(geometry), .groups = "drop")
+
+# Ensure valid geometry
+zones_sf <- sf::st_make_valid(zones_dissolved)
+message("Boundary dissolve complete.")
+
+# ---------- 3. Process Raster Data ----------
+r_cn <- terra::mask(terra::crop(r_ll, terra::vect(china_sf)), terra::vect(china_sf))
+if (!is.na(PLOT_RES_DEG)) {
+  tmpl <- terra::rast(terra::ext(r_cn), resolution = PLOT_RES_DEG, crs = "EPSG:4326")
+  r_plot <- terra::resample(r_cn, tmpl, method = "bilinear")
+} else { r_plot <- r_cn }
+
+df <- as.data.frame(r_plot, xy = TRUE, na.rm = TRUE); names(df) <- c("x", "y", "val")
+cs <- terra::res(r_plot)
+
+# ---------- 4. Prepare Plotting ----------
+lab_lon <- function(x) sprintf("%d°%s", abs(round(x)), ifelse(x >= 0, "E", "W"))
+lab_lat <- function(y) sprintf("%d°%s", abs(round(y)), ifelse(y >= 0, "N", "S"))
+
+pal_colors <- get_diverging_palette(PALETTE_NAME, REVERSE_COLORS)
+rng  <- terra::global(r_plot, fun = range, na.rm = TRUE)[1, ]; vmax <- max(abs(rng))
+limits_vec <- c(-vmax, vmax)
+color_values <- scales::rescale(c(-1, -1/COLOR_SQUEEZE, 0, 1/COLOR_SQUEEZE, 1))
+
+# ---------- 5. Plotting ----------
+message("Generating image...")
+p <- ggplot() +
+  # World base map
+  geom_sf(data = world_sf, fill = WORLD_FILL, color = WORLD_LINE, linewidth = 0.3) +
+  # Raster data
+  geom_tile(data = df, aes(x = x, y = y, fill = val), width = cs[1], height = cs[2]) +
+  # Zone boundaries (Dissolved)
+  geom_sf(data = zones_sf, fill = NA, color = ZONE_BORDER_COL, linewidth = ZONE_BORDER_LWD) +
+  # China national border (Thick overlay)
+  geom_sf(data = china_sf, fill = NA, color = "black", linewidth = CHINA_BORDER_LWD) +
+  
+  scale_fill_gradientn(
+    colors   = pal_colors,
+    values   = color_values,
+    limits   = limits_vec,
+    name     = LEGEND_TITLE,
+    oob      = scales::squish,
+    guide    = guide_colorbar(
+      title.theme = element_text(size = LEGEND_TITLE_SIZE, face = "bold", lineheight = LEGEND_LINEHEIGHT),
+      label.theme = element_text(size = LEGEND_TEXT_SIZE),
+      title.position = "top",
+      title.hjust = 0.5
+    )
+  ) +
+  coord_sf(
+    xlim = c(sf::st_bbox(china_sf)$xmin - MARGIN_LON, sf::st_bbox(china_sf)$xmax + MARGIN_LON),
+    ylim = c(sf::st_bbox(china_sf)$ymin - MARGIN_LAT, sf::st_bbox(china_sf)$ymax + MARGIN_LAT),
+    expand = FALSE
+  ) +
+  scale_x_continuous(labels = lab_lon) +
+  scale_y_continuous(labels = lab_lat) +
+  labs(x = "Longitude", y = "Latitude") +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = c(LEGEND_POS_X, LEGEND_POS_Y),
+    legend.justification = c(0, 0),
+    legend.direction = "vertical",
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA)
+  )
+
+# ---------- 6. Export ----------
+ggsave(OUT_PNG, p, width = IMG_WIDTH_IN, height = IMG_HEIGHT_IN, dpi = IMG_DPI, units = "in")
+ggsave(OUT_TIF, p, width = IMG_WIDTH_IN, height = IMG_HEIGHT_IN, dpi = IMG_DPI, units = "in", device = "tiff")
+
+message("Completed:\n  PNG -> ", normalizePath(OUT_PNG), "\n  TIF -> ", normalizePath(OUT_TIF))
