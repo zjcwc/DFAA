@@ -1,1 +1,320 @@
+# ==============================================================================
+# PROJECT: Spatiotemporal Resilience Analysis Framework
+# ==============================================================================
+# Description:
+#   This script implements a workflow for detecting Early Warning Signals (EWS) 
+#   of critical transitions in raster time series data.
+#
+#   Methodology:
+#   1. Preprocessing: Strict filtering of pixels with incomplete time series.
+#   2. Decomposition: STL (Seasonal-Trend decomposition using Loess) to extract residuals.
+#   3. Autocorrelation: Lag-1 temporal autocorrelation (TAC) using sliding windows.
+#   4. Trend Analysis: Calculation of TAC trends (Slope) as a resilience metric.
+#
+#   Dependencies: sp, raster, zoo, foreach, parallel, doParallel
+# ==============================================================================
 
+library(sp)
+library(raster)
+library(zoo)
+library(foreach)
+library(parallel)
+library(doParallel)
+
+# ==============================================================================
+# 1. Configuration and Parameters
+# ==============================================================================
+
+# --- I/O Paths ---
+# Input Raster (Multi-band GeoTIFF, Band = Time Step)
+INPUT_EVI_PATH <- "PATH/TO/YOUR/INPUT_DATA.tif" 
+
+# Output Directory
+OUTPUT_DIR     <- "PATH/TO/YOUR/OUTPUT_DIR"
+
+# Output Filename Prefix
+FILE_TAG       <- "Resilience_Analysis_Output"
+
+# --- STL Decomposition Parameters ---
+# Configuration for seasonal and trend extraction
+STL_S_WINDOW <- ***  # 
+STL_T_WINDOW <- ***  # 
+STL_L_WINDOW <- ***  # 
+
+# --- Sliding Window Sizes (Months) ---
+# Windows for temporal autocorrelation calculation
+WIN_S <- 36
+WIN_M <- 60
+WIN_L <- 84
+
+# --- Computational Resources ---
+# Max cores to utilize
+TARGET_CORES <- 36
+
+# ==============================================================================
+# 2. Environment Initialization
+# ==============================================================================
+
+# Set raster temporary options
+rasterOptions(tmpdir = file.path(tempdir(), "raster_tmp"), progress = "text")
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Initialize Parallel Cluster
+n_cores <- min(TARGET_CORES, parallel::detectCores(logical = TRUE))
+if (n_cores < 1) n_cores <- 1
+
+cl <- parallel::makeCluster(n_cores, type = "PSOCK")
+doParallel::registerDoParallel(cl)
+
+# Optimize threading environment for worker nodes
+parallel::clusterEvalQ(cl, {
+  Sys.setenv(
+    OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1",
+    BLIS_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1"
+  ); NULL
+})
+
+cat(sprintf("[System] Parallel processing initialized with %d cores.\n", length(cl)))
+
+# Cleanup hook
+on.exit({
+  try(raster::endCluster(), silent = TRUE)
+  try(parallel::stopCluster(cl), silent = TRUE)
+  try(doParallel::registerDoSEQ(), silent = TRUE)
+}, add = TRUE)
+
+# ==============================================================================
+# 3. Data Loading and Preprocessing
+# ==============================================================================
+
+if (!file.exists(INPUT_EVI_PATH)) stop("Input file not found.")
+evi_brick <- brick(INPUT_EVI_PATH)
+
+n_time <- nlayers(evi_brick)
+if (n_time < WIN_L) stop("Time series length is shorter than the maximum window size.")
+
+# Define timeline
+dates <- seq(as.Date("2000-02-01"), by = "month", length.out = n_time)
+yr_start <- as.numeric(format(dates[1], "%Y"))
+mo_start <- as.numeric(format(dates[1], "%m"))
+
+cat(sprintf("[Data] Loaded %d layers. Period: %s to %s.\n", 
+            n_time, as.character(dates[1]), as.character(dates[n_time])))
+
+# Extract values to matrix
+vi_df  <- as.data.frame(evi_brick, xy = TRUE)
+vi_co  <- vi_df[, 1:2]          # Coordinates
+vi_val <- vi_df[, 3:(2 + n_time)] # Values
+
+# --- Preprocessing: Data Filtering ---
+cat("[Process] Filtering valid pixels (Complete time series required)...\n")
+
+# Retain only pixels with zero missing values (NA)
+valid_idx <- which(rowSums(is.na(vi_val)) == 0)
+
+if (length(valid_idx) == 0) stop("No valid pixels found. Check data quality.")
+
+vi_val_valid <- vi_val[valid_idx, , drop = FALSE]
+vi_co_valid  <- vi_co[valid_idx, , drop = FALSE]
+
+cat(sprintf("[Process] Valid pixels remaining: %d\n", length(valid_idx)))
+
+# Save indices for reconstruction
+write.csv(valid_idx, file.path(OUTPUT_DIR, paste0(FILE_TAG, "_valid_indices.csv")), row.names = FALSE)
+
+# Convert to Time Series object
+vi_val_t  <- as.data.frame(t(vi_val_valid))
+vi_val_ts <- ts(vi_val_t, start = c(yr_start, mo_start), freq = 12)
+
+# ==============================================================================
+# 4. STL Decomposition
+# ==============================================================================
+cat("[Process] Executing STL decomposition...\n")
+
+stl_results <- foreach(i = seq_len(ncol(vi_val_ts)), .packages = "stats") %dopar% {
+  v <- vi_val_ts[, i]
+  if(all(!is.na(v))){
+    stl_fit <- stl(v, s.window = STL_S_WINDOW, t.window = STL_T_WINDOW, l.window = STL_L_WINDOW,
+                   s.jump=1, t.jump=1, l.jump=1)
+    list(
+      seas   = stl_fit$time.series[, 1],
+      trend  = stl_fit$time.series[, 2],
+      remain = stl_fit$time.series[, 3]
+    )
+  } else {
+    # Fallback structure
+    dummy <- rep(NA_real_, nrow(vi_val_ts))
+    list(seas = dummy, trend = dummy, remain = dummy)
+  }
+}
+
+# Aggregate results
+vi_seas   <- as.data.frame(do.call(cbind, lapply(stl_results, `[[`, "seas")))
+vi_trend  <- as.data.frame(do.call(cbind, lapply(stl_results, `[[`, "trend")))
+vi_remain <- as.data.frame(do.call(cbind, lapply(stl_results, `[[`, "remain")))
+rm(stl_results); gc()
+
+# Export intermediate CSVs
+write.csv(vi_co_valid, file.path(OUTPUT_DIR, paste0(FILE_TAG, "_stl_coords.csv")), row.names = FALSE)
+write.csv(vi_remain,   file.path(OUTPUT_DIR, paste0(FILE_TAG, "_stl_residuals.csv")), row.names = FALSE)
+
+# ==============================================================================
+# 5. Export STL Residuals (GeoTIFF)
+# ==============================================================================
+cat("[Export] Saving STL residuals raster...\n")
+
+band_names <- sprintf("Resid_%04d_%02d", as.integer(format(dates, "%Y")), as.integer(format(dates, "%m")))
+
+remain_brick <- brick(
+  nrows = nrow(evi_brick), ncols = ncol(evi_brick), nl = n_time,
+  xmn = xmin(evi_brick), xmx = xmax(evi_brick), ymn = ymin(evi_brick), ymx = ymax(evi_brick),
+  crs = projection(evi_brick)
+)
+names(remain_brick) <- band_names
+
+# Reconstruct raster from sparse matrix
+m_remain <- matrix(NA_real_, nrow = ncell(evi_brick), ncol = n_time)
+m_remain[valid_idx, ] <- t(as.matrix(vi_remain))
+values(remain_brick) <- m_remain
+
+writeRaster(
+  remain_brick,
+  filename = file.path(OUTPUT_DIR, paste0(FILE_TAG, "_stl_residuals.tif")),
+  overwrite = TRUE,
+  options  = c("COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"),
+  datatype = "FLT4S"
+)
+rm(m_remain, remain_brick); gc()
+
+# ==============================================================================
+# 6. Temporal Autocorrelation (TAC) Calculation
+# ==============================================================================
+n_pix <- ncol(vi_remain)
+len_s <- n_time - WIN_S + 1
+len_m <- n_time - WIN_M + 1
+len_l <- n_time - WIN_L + 1
+
+# Helper: Generate centered date sequence for windows
+get_center_dates <- function(win_size) {
+  dates[seq(from = ceiling(win_size/2), to = n_time - floor(win_size/2), by = 1)]
+}
+
+dates_s <- get_center_dates(WIN_S)
+dates_m <- get_center_dates(WIN_M)
+dates_l <- get_center_dates(WIN_L)
+
+cat("[Process] Calculating lag-1 autocorrelation (Windows: 36, 60, 84)...\n")
+
+tac_results <- foreach(i = seq_len(n_pix), .packages = c("zoo", "stats")) %dopar% {
+  roll_acf <- function(v, width){
+    zoo::rollapply(
+      v, width = width,
+      FUN = function(z) acf(z, na.action = na.pass, lag.max = 1, plot = FALSE)$acf[2],
+      by.column = FALSE,
+      align = "center"
+    )
+  }
+  v <- vi_remain[, i]
+  if (all(!is.na(v))){
+    list(
+      w36 = roll_acf(v, WIN_S),
+      w60 = roll_acf(v, WIN_M),
+      w84 = roll_acf(v, WIN_L)
+    )
+  } else {
+    list(
+      w36 = rep(NA_real_, len_s),
+      w60 = rep(NA_real_, len_m),
+      w84 = rep(NA_real_, len_l)
+    )
+  }
+}
+
+df_tac_s <- as.data.frame(do.call(cbind, lapply(tac_results, `[[`, "w36")))
+df_tac_m <- as.data.frame(do.call(cbind, lapply(tac_results, `[[`, "w60")))
+df_tac_l <- as.data.frame(do.call(cbind, lapply(tac_results, `[[`, "w84")))
+rm(tac_results, vi_remain, vi_seas, vi_trend); gc()
+
+# Export TAC data (CSV)
+write.csv(df_tac_s, file.path(OUTPUT_DIR, paste0(FILE_TAG, "_tac_36m.csv")), row.names = FALSE)
+write.csv(df_tac_m, file.path(OUTPUT_DIR, paste0(FILE_TAG, "_tac_60m.csv")), row.names = FALSE)
+write.csv(df_tac_l, file.path(OUTPUT_DIR, paste0(FILE_TAG, "_tac_84m.csv")), row.names = FALSE)
+
+# Export Date Mapping
+write.csv(data.frame(band = seq_len(len_s), date = dates_s), file.path(OUTPUT_DIR, paste0(FILE_TAG, "_dates_36m.csv")), row.names = FALSE)
+write.csv(data.frame(band = seq_len(len_m), date = dates_m), file.path(OUTPUT_DIR, paste0(FILE_TAG, "_dates_60m.csv")), row.names = FALSE)
+write.csv(data.frame(band = seq_len(len_l), date = dates_l), file.path(OUTPUT_DIR, paste0(FILE_TAG, "_dates_84m.csv")), row.names = FALSE)
+
+# ==============================================================================
+# 7. Raster Reconstruction and Trend Analysis
+# ==============================================================================
+beginCluster(cl)
+cat("[Process] Computing trends (Slopes) for TAC time series...\n")
+
+tiff_opts <- c("COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES")
+dtype     <- "FLT4S"
+
+# Function generator for linear slope calculation
+slope_calc_generator <- function(t_vec){
+  mt <- mean(t_vec); vt <- sum((t_vec - mt)^2)
+  function(x){
+    if (all(is.na(x))) return(NA_real_)
+    mx <- mean(x, na.rm=TRUE)
+    sum((t_vec - mt) * (x - mx), na.rm=TRUE) / vt
+  }
+}
+
+# --- Processing Window: 36 Months ---
+cat(" -> Processing 36-month window...\n")
+brick_s <- brick(evi_brick[[1]], nl = len_s)
+mat_s   <- matrix(NA_real_, nrow = ncell(evi_brick), ncol = len_s)
+mat_s[valid_idx, ] <- t(as.matrix(df_tac_s))
+values(brick_s) <- mat_s
+names(brick_s) <- paste0("TAC36_", format(dates_s, "%Y_%m"))
+
+writeRaster(brick_s, filename = file.path(OUTPUT_DIR, paste0(FILE_TAG, "_tac_36m.tif")), 
+            overwrite = TRUE, options = tiff_opts, datatype = dtype)
+
+fun_slope_s <- slope_calc_generator(seq_len(len_s))
+clusterR(brick_s, calc, args = list(fun = fun_slope_s), 
+         filename = file.path(OUTPUT_DIR, paste0(FILE_TAG, "_slope_36m.tif")), 
+         overwrite = TRUE, options = tiff_opts, datatype = dtype)
+rm(brick_s, mat_s); gc()
+
+# --- Processing Window: 60 Months ---
+cat(" -> Processing 60-month window...\n")
+brick_m <- brick(evi_brick[[1]], nl = len_m)
+mat_m   <- matrix(NA_real_, nrow = ncell(evi_brick), ncol = len_m)
+mat_m[valid_idx, ] <- t(as.matrix(df_tac_m))
+values(brick_m) <- mat_m
+names(brick_m) <- paste0("TAC60_", format(dates_m, "%Y_%m"))
+
+writeRaster(brick_m, filename = file.path(OUTPUT_DIR, paste0(FILE_TAG, "_tac_60m.tif")), 
+            overwrite = TRUE, options = tiff_opts, datatype = dtype)
+
+fun_slope_m <- slope_calc_generator(seq_len(len_m))
+clusterR(brick_m, calc, args = list(fun = fun_slope_m), 
+         filename = file.path(OUTPUT_DIR, paste0(FILE_TAG, "_slope_60m.tif")), 
+         overwrite = TRUE, options = tiff_opts, datatype = dtype)
+rm(brick_m, mat_m); gc()
+
+# --- Processing Window: 84 Months ---
+cat(" -> Processing 84-month window...\n")
+brick_l <- brick(evi_brick[[1]], nl = len_l)
+mat_l   <- matrix(NA_real_, nrow = ncell(evi_brick), ncol = len_l)
+mat_l[valid_idx, ] <- t(as.matrix(df_tac_l))
+values(brick_l) <- mat_l
+names(brick_l) <- paste0("TAC84_", format(dates_l, "%Y_%m"))
+
+writeRaster(brick_l, filename = file.path(OUTPUT_DIR, paste0(FILE_TAG, "_tac_84m.tif")), 
+            overwrite = TRUE, options = tiff_opts, datatype = dtype)
+
+fun_slope_l <- slope_calc_generator(seq_len(len_l))
+clusterR(brick_l, calc, args = list(fun = fun_slope_l), 
+         filename = file.path(OUTPUT_DIR, paste0(FILE_TAG, "_slope_84m.tif")), 
+         overwrite = TRUE, options = tiff_opts, datatype = dtype)
+rm(brick_l, mat_l); gc()
+
+endCluster()
+
+cat("Analysis complete. Results saved to:", OUTPUT_DIR, "\n")
